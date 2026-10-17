@@ -1,0 +1,152 @@
+name: Build Folia iPhone IPA
+'on':
+  workflow_dispatch:
+  push:
+    paths:
+      - .github/workflows/folia-ios-ipa.yml
+permissions:
+  contents: read
+jobs:
+  build-ios:
+    runs-on: macos-15
+    timeout-minutes: 40
+    steps:
+      - name: Check out Folia fork
+        uses: actions/checkout@v4
+      - name: Install XcodeGen
+        run: brew install xcodegen
+      - name: Generate iPhone WebView app
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p iphone/Sources iphone/Assets.xcassets/AppIcon.appiconset
+          cat > iphone/Sources/FoliaApp.swift <<'FOLIA_SWIFT'
+          import UIKit
+          import WebKit
+          import AVFoundation
+
+          @main
+          final class FoliaAppDelegate: UIResponder, UIApplicationDelegate {
+              var window: UIWindow?
+
+              func application(_ application: UIApplication,
+                               didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil) -> Bool {
+                  try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .default)
+                  let window = UIWindow(frame: UIScreen.main.bounds)
+                  window.rootViewController = FoliaViewController()
+                  window.makeKeyAndVisible()
+                  self.window = window
+                  return true
+              }
+          }
+
+          final class FoliaViewController: UIViewController, WKNavigationDelegate, WKUIDelegate {
+              private let startURL = URL(string: "https://folia-player-three-delta.vercel.app")!
+              private var browser: WKWebView!
+
+              override func loadView() {
+                  let configuration = WKWebViewConfiguration()
+                  configuration.websiteDataStore = .default()
+                  configuration.allowsInlineMediaPlayback = true
+                  configuration.mediaTypesRequiringUserActionForPlayback = []
+                  configuration.allowsAirPlayForMediaPlayback = true
+
+                  let webView = WKWebView(frame: .zero, configuration: configuration)
+                  webView.navigationDelegate = self
+                  webView.uiDelegate = self
+                  webView.isOpaque = false
+                  webView.backgroundColor = .black
+                  webView.scrollView.contentInsetAdjustmentBehavior = .never
+                  browser = webView
+                  self.view = webView
+              }
+
+              override func viewDidLoad() {
+                  super.viewDidLoad()
+                  browser.load(URLRequest(url: startURL, cachePolicy: .useProtocolCachePolicy))
+              }
+
+              func webView(_ webView: WKWebView,
+                           createWebViewWith configuration: WKWebViewConfiguration,
+                           for navigationAction: WKNavigationAction,
+                           windowFeatures: WKWindowFeatures) -> WKWebView? {
+                  if navigationAction.targetFrame == nil {
+                      webView.load(navigationAction.request)
+                  }
+                  return nil
+              }
+
+              func webView(_ webView: WKWebView,
+                           didFailProvisionalNavigation navigation: WKNavigation!,
+                           withError error: Error) {
+                  let alert = UIAlertController(title: "Folia 加载失败",
+                                                message: "请检查网络和 Folia 网站是否能够打开。",
+                                                preferredStyle: .alert)
+                  alert.addAction(UIAlertAction(title: "重试", style: .default) { [weak self] _ in
+                      guard let self = self else { return }
+                      self.browser.load(URLRequest(url: self.startURL))
+                  })
+                  self.present(alert, animated: true)
+              }
+          }
+          FOLIA_SWIFT
+          cat > iphone/project.yml <<'FOLIA_PROJECT'
+          name: Folia
+          options:
+            bundleIdPrefix: com.epistley
+          settings:
+            base:
+              SWIFT_VERSION: '5.0'
+              IPHONEOS_DEPLOYMENT_TARGET: '16.0'
+              TARGETED_DEVICE_FAMILY: '1,2'
+              ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+              CODE_SIGNING_ALLOWED: 'NO'
+          targets:
+            Folia:
+              type: application
+              platform: iOS
+              sources:
+                - Sources
+                - Assets.xcassets
+              info:
+                path: Info.plist
+                properties:
+                  CFBundleDisplayName: Folia
+                  CFBundleShortVersionString: '1.0.0'
+                  CFBundleVersion: '1'
+                  UILaunchScreen: {}
+                  UIBackgroundModes:
+                    - audio
+                  UIStatusBarStyle: UIStatusBarStyleLightContent
+                  UISupportedInterfaceOrientations:
+                    - UIInterfaceOrientationPortrait
+                    - UIInterfaceOrientationLandscapeLeft
+                    - UIInterfaceOrientationLandscapeRight
+                    - UIInterfaceOrientationPortraitUpsideDown
+          FOLIA_PROJECT
+          cat > iphone/Assets.xcassets/AppIcon.appiconset/Contents.json <<'ICON_JSON'
+          { "images": [{ "filename": "icon.png", "idiom": "universal", "platform": "ios", "size": "1024x1024" }], "info": { "author": "xcode", "version": 1 } }
+          ICON_JSON
+          if [ ! -f build/icon.png ]; then
+            echo 'Official Folia icon missing from the checked out repository' >&2
+            exit 1
+          fi
+          sips -s format jpeg build/icon.png --out "$RUNNER_TEMP/folia-icon.jpg" >/dev/null
+          sips -z 1024 1024 -s format png "$RUNNER_TEMP/folia-icon.jpg" --out iphone/Assets.xcassets/AppIcon.appiconset/icon.png >/dev/null
+          cd iphone
+          xcodegen generate --spec project.yml
+      - name: Build unsigned Folia app
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild -project iphone/Folia.xcodeproj -scheme Folia -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath "$RUNNER_TEMP/folia-derived" CODE_SIGNING_ALLOWED=NO build
+          mkdir -p Payload
+          cp -R "$RUNNER_TEMP/folia-derived/Build/Products/Release-iphoneos/Folia.app" Payload/Folia.app
+          zip -qry Folia-iPhone-unsigned.ipa Payload
+          unzip -t Folia-iPhone-unsigned.ipa | tail -n 1
+      - name: Save IPA download
+        uses: actions/upload-artifact@v4
+        with:
+          name: Folia-iPhone-unsigned-IPA
+          path: Folia-iPhone-unsigned.ipa
+          retention-days: 14
